@@ -1,4 +1,4 @@
-# Liminal Intent
+# Liminal_Intent
 
 VCV Rack 2 plugin with one module, **Pulsaret PD**: a polyphonic hybrid phase-distortion /
 pulsaret oscillator with a formant-locked secondary carrier.
