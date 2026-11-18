@@ -400,58 +400,100 @@ public:
         }
     }
 
-    float synthesizeSubSample(size_t voiceIdx, const VoiceParameters& p, float oversampledRate) noexcept {
-        const float dt = p.fundamentalHz / oversampledRate;
-        float phi1 = primaryPhase_[voiceIdx];
+    // Per-output-sample constants. Everything here depends only on the parameters and the
+    // rate, so it is computed once per output sample instead of once per sub-sample.
+    // Values are computed with exactly the same float operations as before, so the
+    // sub-sample results are unchanged.
+    struct SubParams {
+        float dt;                 // phase increment per sub-sample
+        float d, slope1, slope2;  // primary knee
+        float formantRatio;       // formant / fundamental
+        float d2, slope2a, slope2b;   // secondary knee: 0.5/d2 and 0.5/(1-d2)
+        float duty;
+        float mix, oneMinusMix;
+        float ceiling;
+        FormantWindow window;
+    };
 
-        const float d = std::clamp(p.pdDistortion, 0.02f, 0.98f);
-        const float slope1 = 0.5f / d;
-        const float slope2 = 0.5f / (1.0f - d);
-        const float warped1 = (phi1 < d) ? (phi1 * slope1) : (0.5f + (phi1 - d) * slope2);
-
+    static SubParams makeSubParams(const VoiceParameters& p, float oversampledRate) noexcept {
         // Formant range clamp (absolute Hz). Above ~4 kHz the secondary carrier's
         // aliasing rises steeply and independently of pitch (measured: -35 dB @4k,
         // -29 dB @5k, -23 dB @8k at mix 1, 4x). Applied after any chord pitch-ratio
         // scaling, so a transposed chord voice is also held at the ceiling.
         static constexpr float kFormantMinHz = 200.0f;
         static constexpr float kFormantMaxHz = 4000.0f;
+        SubParams sp{};
+        sp.dt = p.fundamentalHz / oversampledRate;
+        sp.d = std::clamp(p.pdDistortion, 0.02f, 0.98f);
+        sp.slope1 = 0.5f / sp.d;
+        sp.slope2 = 0.5f / (1.0f - sp.d);
         const float formantHz = std::clamp(p.formantHz, kFormantMinHz, kFormantMaxHz);
-        const float formantRatio = formantHz / ((p.fundamentalHz > 1.0f) ? p.fundamentalHz : 1.0f);
-        float phi2 = std::fmod(phi1 * formantRatio, 1.0f);
-        const float d2 = 1.0f - d * 0.65f;
-        const float warped2 = (phi2 < d2) ? (phi2 * (0.5f / d2)) : (0.5f + (phi2 - d2) * (0.5f / (1.0f - d2)));
+        sp.formantRatio = formantHz / ((p.fundamentalHz > 1.0f) ? p.fundamentalHz : 1.0f);
+        sp.d2 = 1.0f - sp.d * 0.65f;
+        sp.slope2a = 0.5f / sp.d2;
+        sp.slope2b = 0.5f / (1.0f - sp.d2);
+        sp.duty = std::clamp(p.pulsaretDuty, 0.1f, 1.0f);
+        sp.mix = p.secondaryPdMix;
+        sp.oneMinusMix = 1.0f - p.secondaryPdMix;
+        sp.ceiling = p.voiceCeiling;
+        sp.window = p.windowShape;
+        return sp;
+    }
 
-        const float duty = std::clamp(p.pulsaretDuty, 0.1f, 1.0f);
-        const float u = (phi1 < duty) ? (phi1 / duty) : 1.0f;
-        const float env = evaluateWindow(u, p.windowShape);
+    float synthesizeSubSample(size_t voiceIdx, const SubParams& sp) noexcept {
+        float phi1 = primaryPhase_[voiceIdx];
+        float out = 0.0f;
 
-        constexpr float kTwoPi = 2.0f * std::numbers::pi_v<float>;
-        const float c1 = -std::cos(kTwoPi * warped1);
-        const float c2 =  std::sin(kTwoPi * warped2);
-        float out = env * ((1.0f - p.secondaryPdMix) * c1 + p.secondaryPdMix * c2);
+        // Outside the pulsaret (phi1 >= duty) the window is exactly 0, so the carriers are
+        // not evaluated at all: the result was 0 * carrier before as well.
+        if (phi1 < sp.duty) {
+            const float u = phi1 / sp.duty;
+            const float env = evaluateWindow(u, sp.window);
+            if (env != 0.0f) {
+                constexpr float kTwoPi = 2.0f * std::numbers::pi_v<float>;
+                float carrier = 0.0f;
+                if (sp.oneMinusMix != 0.0f) {
+                    const float warped1 = (phi1 < sp.d) ? (phi1 * sp.slope1) : (0.5f + (phi1 - sp.d) * sp.slope2);
+                    carrier += sp.oneMinusMix * -std::cos(kTwoPi * warped1);
+                }
+                if (sp.mix != 0.0f) {
+                    // x - floor(x) equals fmod(x, 1) exactly for x >= 0, and is cheaper.
+                    const float x = phi1 * sp.formantRatio;
+                    const float phi2 = x - std::floor(x);
+                    const float warped2 = (phi2 < sp.d2) ? (phi2 * sp.slope2a) : (0.5f + (phi2 - sp.d2) * sp.slope2b);
+                    carrier += sp.mix * std::sin(kTwoPi * warped2);
+                }
+                out = env * carrier;
+            }
+        }
 
-        phi1 += dt;
+        phi1 += sp.dt;
         if (phi1 >= 1.0f) phi1 -= 1.0f;
         primaryPhase_[voiceIdx] = phi1;
 
-        return out * p.voiceCeiling;
+        return out * sp.ceiling;
+    }
+
+    // Kept for API compatibility: one sub-sample with parameters computed on the spot.
+    float synthesizeSubSample(size_t voiceIdx, const VoiceParameters& p, float oversampledRate) noexcept {
+        return synthesizeSubSample(voiceIdx, makeSubParams(p, oversampledRate));
     }
 
     float processVoiceSampleRaw(size_t voiceIdx, const VoiceParameters& p, OversampleFactor os) noexcept {
         if (os == OversampleFactor::None_1x) {
-            return synthesizeSubSample(voiceIdx, p, sampleRate_);
+            return synthesizeSubSample(voiceIdx, makeSubParams(p, sampleRate_));
         }
         if (os == OversampleFactor::Halfband_2x) {
-            const float osRate = sampleRate_ * 2.0f;
-            const float s0 = synthesizeSubSample(voiceIdx, p, osRate);
-            const float s1 = synthesizeSubSample(voiceIdx, p, osRate);
+            const SubParams sp = makeSubParams(p, sampleRate_ * 2.0f);
+            const float s0 = synthesizeSubSample(voiceIdx, sp);
+            const float s1 = synthesizeSubSample(voiceIdx, sp);
             return decimStage1_[voiceIdx].process2To1(s0, s1);
         }
-        const float osRate = sampleRate_ * 4.0f;
-        const float s0 = synthesizeSubSample(voiceIdx, p, osRate);
-        const float s1 = synthesizeSubSample(voiceIdx, p, osRate);
-        const float s2 = synthesizeSubSample(voiceIdx, p, osRate);
-        const float s3 = synthesizeSubSample(voiceIdx, p, osRate);
+        const SubParams sp = makeSubParams(p, sampleRate_ * 4.0f);
+        const float s0 = synthesizeSubSample(voiceIdx, sp);
+        const float s1 = synthesizeSubSample(voiceIdx, sp);
+        const float s2 = synthesizeSubSample(voiceIdx, sp);
+        const float s3 = synthesizeSubSample(voiceIdx, sp);
         const float mid0 = decimStage1_[voiceIdx].process2To1(s0, s1);
         const float mid1 = decimStage1_[voiceIdx].process2To1(s2, s3);
         return decimStage2_[voiceIdx].process2To1(mid0, mid1);

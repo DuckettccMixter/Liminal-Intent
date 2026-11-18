@@ -8,6 +8,8 @@
 //   V/OCT, FORMANT CV : 1 V per octave, added to the knob
 //   DIST, MIX, DUTY CV: 0..10 V sweeps the full range, added to the knob
 //   SYNC              : rising through 0 V restarts the waveform; unpatched = free-running
+//   TRACK switch      : Fixed = formant knob/CV is an absolute frequency;
+//                       Track = it is the formant at C4 (0 V) and moves with the note
 //   OUT               : strictly within +-5 V
 #include "plugin.hpp"
 #include "PulsaretHostVoice.hpp"
@@ -22,6 +24,7 @@ struct PulsaretPD : Module {
 		DUTY_PARAM,
 		WINDOW_PARAM,
 		OVERSAMPLE_PARAM,
+		TRACK_PARAM,        // added in 2.1.0; appended so saved patches keep their parameter ids
 		PARAMS_LEN
 	};
 	enum InputId {
@@ -49,6 +52,7 @@ struct PulsaretPD : Module {
 	float preparedSampleRate = 0.f;
 	int windowIndex = -1;
 	int oversampleIndex = -1;
+	int trackIndex = -1;
 
 	PulsaretPD() {
 		config(PARAMS_LEN, INPUTS_LEN, OUTPUTS_LEN, LIGHTS_LEN);
@@ -61,6 +65,7 @@ struct PulsaretPD : Module {
 		configParam(DUTY_PARAM, 0.1f, 1.f, 0.65f, "Pulsaret duty", "%", 0.f, 100.f);
 		configSwitch(WINDOW_PARAM, 0.f, 2.f, 1.f, "Window", {"Hann", "Blackman-Harris", "Tukey"});
 		configSwitch(OVERSAMPLE_PARAM, 0.f, 2.f, 2.f, "Oversampling", {"1x", "2x", "4x"});
+		configSwitch(TRACK_PARAM, 0.f, 1.f, 0.f, "Formant", {"Fixed", "Track"});
 
 		configInput(VOCT_INPUT, "1V/octave pitch");
 		configInput(FORMANT_INPUT, "Formant (1V/octave)");
@@ -76,6 +81,7 @@ struct PulsaretPD : Module {
 			voices[c].prepare(sampleRate);
 			if (windowIndex >= 0) voices[c].setWindow(windowIndex);
 			if (oversampleIndex >= 0) voices[c].setOversampling(oversampleIndex);
+			if (trackIndex >= 0) voices[c].setFormantTracking(trackIndex == 1, dsp::FREQ_C4);
 		}
 		preparedSampleRate = sampleRate;
 	}
@@ -101,6 +107,11 @@ struct PulsaretPD : Module {
 			oversampleIndex = o;
 			for (int c = 0; c < kMaxChannels; c++) voices[c].setOversampling(o);
 		}
+		const int t = (int) std::round(params[TRACK_PARAM].getValue());
+		if (t != trackIndex) {
+			trackIndex = t;
+			for (int c = 0; c < kMaxChannels; c++) voices[c].setFormantTracking(t == 1, dsp::FREQ_C4);
+		}
 
 		const int channels = std::max(1, inputs[VOCT_INPUT].getChannels());
 		const float pitchKnob = params[PITCH_PARAM].getValue() / 12.f;      // octaves from C4
@@ -118,7 +129,10 @@ struct PulsaretPD : Module {
 			const float duty = dutyKnob + inputs[DUTY_INPUT].getPolyVoltage(c) * 0.1f;
 			const bool sync = inputs[SYNC_INPUT].getPolyVoltage(c) > 0.f;
 
-			const float y = voices[c].process(f0, clamp(formantHz, kFormantMinHz, kFormantMaxHz), dist, mix, duty, sync);
+			// In Track mode the knob/CV formant is transposed by the note inside the voice, and the
+			// core applies the 200..4000 Hz limit after that; Fixed mode limits it here as before.
+			const float formantIn = (trackIndex == 1) ? formantHz : clamp(formantHz, kFormantMinHz, kFormantMaxHz);
+			const float y = voices[c].process(f0, formantIn, dist, mix, duty, sync);
 			outputs[OUT_OUTPUT].setVoltage(5.f * y, c);
 		}
 		outputs[OUT_OUTPUT].setChannels(channels);
@@ -176,6 +190,7 @@ struct PulsaretPDWidget : ModuleWidget {
 
 		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(j1, 112.0f)), module, PulsaretPD::DUTY_INPUT));
 		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(j2, 112.0f)), module, PulsaretPD::SYNC_INPUT));
+		addParam(createParamCentered<CKSS>(mm2px(Vec(j3, 112.0f)), module, PulsaretPD::TRACK_PARAM));
 		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(j4, 112.0f)), module, PulsaretPD::OUT_OUTPUT));
 
 		PulsaretLabels* text = new PulsaretLabels;
@@ -188,7 +203,7 @@ struct PulsaretPDWidget : ModuleWidget {
 			{colL + 9.5f, 68.6f, "TUK", 7.f}, {colL + 9.5f, 72.0f, "B-H", 7.f}, {colL + 9.5f, 75.4f, "HANN", 7.f},
 			{colR + 8.0f, 68.6f, "4x", 7.f}, {colR + 8.0f, 72.0f, "2x", 7.f}, {colR + 8.0f, 75.4f, "1x", 7.f},
 			{j1, 88.0f, "V/OCT", 8.f}, {j2, 88.0f, "FORM", 8.f}, {j3, 88.0f, "DIST", 8.f}, {j4, 88.0f, "MIX", 8.f},
-			{j1, 105.0f, "DUTY", 8.f}, {j2, 105.0f, "SYNC", 8.f}, {j4, 105.0f, "OUT", 8.f},
+			{j1, 105.0f, "DUTY", 8.f}, {j2, 105.0f, "SYNC", 8.f}, {j3, 105.0f, "TRACK", 8.f}, {j4, 105.0f, "OUT", 8.f},
 			{25.4f, 122.5f, "LIMINAL INTENT", 8.f},
 		};
 		addChild(text);
